@@ -5,6 +5,7 @@ import cn.edu.course.chat.client.HistoryStore;
 import cn.edu.course.chat.client.MainFrame;
 import cn.edu.course.chat.common.Frame;
 import cn.edu.course.chat.common.MessageType;
+import cn.edu.course.chat.common.ProtocolCodec;
 import cn.edu.course.chat.server.ChatServer;
 
 import javax.imageio.ImageIO;
@@ -30,6 +31,9 @@ import java.awt.event.MouseEvent;
 import java.awt.event.WindowEvent;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -201,6 +205,8 @@ public final class SwingTest {
                     restored.close();
                     System.out.println("SwingTest：关闭窗口并使用同 profile 重开，公共与私聊历史读取及未读状态，通过");
                     exerciseOverload(robot, dataRoot, server, windows, evidence);
+                    exerciseRapidConnection(robot, dataRoot, server, windows, evidence);
+                    exerciseConnectingDrag(robot, dataRoot, windows, evidence);
                 } finally {
                     closeWindows(windows);
                 }
@@ -208,6 +214,7 @@ public final class SwingTest {
             await("所有聊天后台线程退出", () -> chatThreads().isEmpty());
             backgroundCheck();
             System.out.println("SwingTest：全部窗口已 dispose，聊天后台线程数量=" + chatThreads().size());
+            System.out.println("SwingTest：首次历史读取在窗口出现前，保存时的响应以已执行窗口操作核查");
             System.out.println("SwingTest：中文输入法候选确认未执行，需要实际中文输入法人工验证");
         } finally {
             closeWindows(windows);
@@ -459,6 +466,113 @@ public final class SwingTest {
         return after >= before ? Math.min(30, after) : -Math.min(30, before);
     }
 
+    private static void exerciseRapidConnection(Robot robot, Path dataRoot, ChatServer server,
+                                                List<GuiClient> windows, Path evidence) throws Exception {
+        String nickname = "GuiRapid";
+        String observerNickname = "RapidObserver";
+        try (RealSender observer = new RealSender();
+             WithheldWelcomePeer firstPeer = new WithheldWelcomePeer(nickname)) {
+            observer.connection.connect(HOST, server.port(), observerNickname);
+            observer.awaitFrame(frame -> frame.type() == MessageType.WELCOME
+                    && frame.from().equals(observerNickname));
+            GuiClient target = open(dataRoot, "gui-rapid", nickname, firstPeer.port(), 0);
+            windows.add(target);
+            try {
+                click(target, "连接");
+                firstPeer.awaitJoin();
+                await("快速操作的首次连接正在等待 WELCOME", () -> onEdt(() ->
+                        target.hasLabel("连接中") && target.button("取消连接").isEnabled()));
+                click(target, "取消连接");
+                await("快速取消后连接按钮恢复", () -> onEdt(() ->
+                        target.hasLabel("已断开") && target.button("连接").isEnabled()));
+                act(() -> target.field("服务端端口").setText(Integer.toString(server.port())));
+                connect(target);
+                firstPeer.awaitClosed();
+                await("新连接在窗口与服务端广播中只出现一个昵称", () -> onEdt(() ->
+                        listValues(target.online()).stream().filter(nickname::equals).count() == 1)
+                        && observer.latestUsers.get().stream().filter(nickname::equals).count() == 1);
+                String incoming = "GUI 快速取消重连后的私聊";
+                long requestId = observer.connection.send(nickname, incoming);
+                observer.awaitFrame(frame -> frame.type() == MessageType.CHAT_EVENT
+                        && frame.requestId() == requestId && frame.text().equals(incoming));
+                await("快速重连后的私聊会话出现", () -> onEdt(() ->
+                        listValues(target.conversations()).contains(observerNickname)));
+                select(target, observerNickname);
+                awaitRecord(target, incoming);
+                String outgoing = "GUI 快速取消重连后的回复";
+                send(target, outgoing);
+                observer.awaitFrame(frame -> frame.type() == MessageType.CHAT_EVENT
+                        && frame.from().equals(nickname) && frame.text().equals(outgoing));
+                awaitRecord(target, outgoing);
+                await("新连接通信完成后状态保持已连接", () -> onEdt(() ->
+                        target.hasLabel("已连接") && target.button("断开").isEnabled()
+                                && target.pending().getText().isEmpty()
+                                && listValues(target.online()).stream().filter(nickname::equals).count() == 1));
+                capture(robot, target, evidence.resolve("2026-11-02-swing-rapid-reconnect.png"));
+                System.out.println("SwingTest：A16 真实连接、取消、重新连接，单个在线昵称与双向通信，通过");
+            } finally {
+                target.close();
+            }
+        }
+    }
+
+    private static void exerciseConnectingDrag(Robot robot, Path dataRoot,
+                                               List<GuiClient> windows, Path evidence) throws Exception {
+        try (WithheldWelcomePeer peer = new WithheldWelcomePeer("GuiWaiting")) {
+            GuiClient target = open(dataRoot, "gui-waiting", "GuiWaiting", peer.port(), 0);
+            windows.add(target);
+            try {
+                click(target, "连接");
+                peer.awaitJoin();
+                await("真实握手等待中的窗口仍然可以操作", () -> onEdt(() ->
+                        target.hasLabel("连接中") && target.button("取消连接").isEnabled()));
+                act(() -> {
+                    target.frame.toFront();
+                    target.frame.requestFocus();
+                });
+                await("握手等待窗口成为活动窗口", () -> onEdt(target.frame::isActive));
+                Rectangle original = onEdt(target.frame::getBounds);
+                Rectangle screen = onEdt(() -> target.frame.getGraphicsConfiguration().getBounds());
+                check(screen.contains(original), "连接等待窗口应当完整处于屏幕内");
+                int dx = movement(original.x - screen.x,
+                        screen.x + screen.width - original.x - original.width);
+                int dy = movement(original.y - screen.y,
+                        screen.y + screen.height - original.y - original.height);
+                check(dx != 0 || dy != 0, "屏幕应当具有连接等待窗口的拖动空间");
+                int titleHeight = onEdt(() -> target.frame.getInsets().top);
+                check(titleHeight >= 12, "连接等待窗口应当具有真实标题栏");
+                int sourceX = original.x + original.width / 2;
+                int sourceY = original.y + titleHeight / 2;
+                robot.mouseMove(sourceX, sourceY);
+                robot.mousePress(InputEvent.BUTTON1_DOWN_MASK);
+                try {
+                    for (int step = 1; step <= 5; step++) {
+                        robot.mouseMove(sourceX + dx * step / 5, sourceY + dy * step / 5);
+                    }
+                } finally {
+                    robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+                }
+                robot.waitForIdle();
+                await("Robot 在真实握手等待期间拖动窗口", () -> onEdt(() ->
+                        !target.frame.getLocation().equals(original.getLocation())
+                                && target.hasLabel("连接中")
+                                && target.button("取消连接").isEnabled()));
+                check(onEdt(() -> screen.contains(target.frame.getBounds())),
+                        "连接等待期间拖动后的窗口应当完整处于屏幕内");
+                capture(robot, target, evidence.resolve("2026-11-02-swing-connecting-drag.png"));
+                click(target, "取消连接");
+                await("握手等待可主动取消并释放界面状态", () -> onEdt(() ->
+                        target.hasLabel("已断开") && target.button("连接").isEnabled()
+                                && !target.button("发送").isEnabled()
+                                && target.online().getModel().getSize() == 0));
+                peer.awaitClosed();
+                System.out.println("SwingTest：A21 真实连接等待期间 Robot 拖动窗口，取消按钮响应且对端收到 EOF，通过");
+            } finally {
+                target.close();
+            }
+        }
+    }
+
     private static void focusInput(Robot robot, GuiClient peer) throws Exception {
         act(() -> {
             peer.frame.toFront();
@@ -682,6 +796,7 @@ public final class SwingTest {
 
     private static final class RealSender implements AutoCloseable {
         private final BlockingQueue<Frame> frames = new LinkedBlockingQueue<>(512);
+        private final AtomicReference<List<String>> latestUsers = new AtomicReference<>(List.of());
         private final ChatConnection connection = new ChatConnection(new ChatConnection.Listener() {
             @Override
             public void onState(ChatConnection.State state, String detail) {
@@ -689,6 +804,9 @@ public final class SwingTest {
 
             @Override
             public void onFrame(Frame frame) {
+                if (frame.type() == MessageType.USER_LIST) {
+                    latestUsers.set(List.copyOf(frame.users()));
+                }
                 check(frames.offer(frame), "真实过载发送者的测试接收队列达到上限");
             }
         });
@@ -711,6 +829,81 @@ public final class SwingTest {
         @Override
         public void close() {
             connection.close();
+        }
+    }
+
+    private static final class WithheldWelcomePeer implements AutoCloseable {
+        private final ServerSocket listener;
+        private final CountDownLatch joined = new CountDownLatch(1);
+        private final CountDownLatch ended = new CountDownLatch(1);
+        private final AtomicReference<Throwable> failure = new AtomicReference<>();
+        private final Thread worker;
+        private volatile Socket accepted;
+        private volatile boolean closing;
+
+        private WithheldWelcomePeer(String nickname) throws IOException {
+            listener = new ServerSocket(0, 1, InetAddress.getByName(HOST));
+            listener.setSoTimeout((int) WAIT_MILLIS);
+            worker = new Thread(() -> {
+                try (Socket socket = listener.accept()) {
+                    accepted = socket;
+                    socket.setSoTimeout((int) WAIT_MILLIS);
+                    Frame join = ProtocolCodec.read(socket.getInputStream());
+                    check(join != null && join.type() == MessageType.JOIN
+                            && join.from().equals(nickname), "真实握手等待对端应当收到指定昵称的 JOIN");
+                    joined.countDown();
+                    check(ProtocolCodec.read(socket.getInputStream()) == null,
+                            "取消握手等待后，真实对端应当收到 EOF");
+                } catch (Throwable problem) {
+                    if (!closing) {
+                        failure.set(problem);
+                    }
+                } finally {
+                    ended.countDown();
+                }
+            }, "swing-test-withheld-welcome-" + listener.getLocalPort());
+            worker.start();
+        }
+
+        private int port() {
+            return listener.getLocalPort();
+        }
+
+        private void awaitJoin() throws Exception {
+            check(joined.await(WAIT_MILLIS, TimeUnit.MILLISECONDS), "真实对端应当在期限内收到 JOIN");
+            checkFailure();
+        }
+
+        private void awaitClosed() throws Exception {
+            check(ended.await(WAIT_MILLIS, TimeUnit.MILLISECONDS), "取消后真实对端连接应当在期限内结束");
+            worker.join(WAIT_MILLIS);
+            check(!worker.isAlive(), "真实握手等待测试线程应当结束");
+            checkFailure();
+        }
+
+        private void checkFailure() {
+            if (failure.get() != null) {
+                throw new AssertionError("真实握手等待对端异常", failure.get());
+            }
+        }
+
+        @Override
+        public void close() throws Exception {
+            closing = true;
+            try {
+                listener.close();
+            } finally {
+                try {
+                    Socket socket = accepted;
+                    if (socket != null) {
+                        socket.close();
+                    }
+                } finally {
+                    worker.join(WAIT_MILLIS);
+                    check(!worker.isAlive(), "关闭真实握手等待对端后，测试线程应当结束");
+                }
+            }
+            checkFailure();
         }
     }
 
