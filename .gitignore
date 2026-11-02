@@ -28,3 +28,9 @@ replay_pid*
 
 .cache/
 /tmp
+AGENTS.md
+
+# Java 构建产物与本地聊天资料
+/build/
+/dist/
+/data/
