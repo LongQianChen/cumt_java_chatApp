@@ -142,6 +142,8 @@ public final class ChatServer implements AutoCloseable {
         try {
             while (running) {
                 Socket socket = listener.accept();
+                log("接入连接：本地端点=" + socket.getLocalSocketAddress()
+                        + "，远端端点=" + socket.getRemoteSocketAddress());
                 try {
                     socket.setTcpNoDelay(true);
                     socket.setSendBufferSize(8_192);

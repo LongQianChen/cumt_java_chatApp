@@ -42,6 +42,7 @@ public final class ServerTest {
 
     public static void run() throws Exception {
         System.out.println("ServerTest：显式启用 127.0.0.1 开发回环自测，不代替指定 IP 验收");
+        sourceBoundEndpoints();
         joinAndRouting();
         framingAndIsolation();
         capacityAndTimeouts();
@@ -54,6 +55,49 @@ public final class ServerTest {
                 .filter(name -> name.startsWith("chat-server-") || name.startsWith("server-test-"))
                 .toList();
         check(alive.isEmpty(), "测试结束后不能保留服务端或测试线程：" + alive);
+    }
+
+    private static void sourceBoundEndpoints() throws Exception {
+        ByteArrayOutputStream logs = new ByteArrayOutputStream();
+        PrintStream original = System.out;
+        List<String> expectedEndpoints = new ArrayList<>();
+        try (PrintStream capture = new PrintStream(logs, true, StandardCharsets.UTF_8)) {
+            System.setOut(capture);
+            try (ChatServer server = started(); Socket first = new Socket(); Socket second = new Socket()) {
+                List<Socket> clients = List.of(first, second);
+                List<String> sources = List.of("127.0.0.1", "127.0.0.2");
+                for (int index = 0; index < clients.size(); index++) {
+                    Socket client = clients.get(index);
+                    client.bind(new InetSocketAddress(sources.get(index), 0));
+                    client.connect(new InetSocketAddress(HOST, server.port()), 2_000);
+                    client.setSoTimeout((int) WAIT_MILLIS);
+                    check(client.getLocalAddress().getHostAddress().equals(sources.get(index)),
+                            "客户端必须使用显式绑定的来源 IP");
+                    expectedEndpoints.add("接入连接：本地端点=" + client.getRemoteSocketAddress()
+                            + "，远端端点=" + client.getLocalSocketAddress());
+                    ProtocolCodec.write(client.getOutputStream(), Frame.request(MessageType.JOIN,
+                            1, "BoundSource" + index, "", ""));
+                    Frame welcome = ProtocolCodec.read(client.getInputStream());
+                    check(welcome != null && welcome.type() == MessageType.WELCOME,
+                            "分别绑定来源 IP 的连接必须能够正常加入");
+                    ProtocolCodec.write(client.getOutputStream(),
+                            Frame.request(MessageType.PING, 2, "", "", ""));
+                    Frame response;
+                    do {
+                        response = ProtocolCodec.read(client.getInputStream());
+                        check(response != null, "等待心跳响应期间连接不能提前关闭");
+                    } while (response.type() != MessageType.PONG);
+                    check(response.requestId() == 2, "来源绑定连接必须收到本次心跳响应");
+                }
+            } finally {
+                System.setOut(original);
+            }
+        }
+        String output = logs.toString(StandardCharsets.UTF_8);
+        for (String expected : expectedEndpoints) {
+            check(output.contains(expected), "接入日志必须使用 Socket 的实际本地与远端端点：" + expected);
+        }
+        System.out.println("ServerTest：来源 127.0.0.1 与 127.0.0.2 的显式绑定、JOIN、心跳及真实端点日志通过");
     }
 
     private static void joinAndRouting() throws Exception {
