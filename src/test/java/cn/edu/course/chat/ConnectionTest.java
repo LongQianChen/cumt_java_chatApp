@@ -10,11 +10,16 @@ import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -36,6 +41,8 @@ public final class ConnectionTest {
     }
 
     public static void run() throws Exception {
+        explicitLocalBinding();
+        unavailableLocalBinding();
         connectionRefused();
         faultDeadlines();
         rejectionAndProtocolFailure();
@@ -48,6 +55,107 @@ public final class ConnectionTest {
                 "A22 客户端后台线程存在残留");
     }
 
+    private static void explicitLocalBinding() throws Exception {
+        Probe firstProbe = new Probe();
+        Probe secondProbe = new Probe();
+        try (ServerSocket server = loopbackServer();
+             ChatConnection first = new ChatConnection(firstProbe);
+             ChatConnection second = new ChatConnection(secondProbe)) {
+            server.setSoTimeout(5000);
+            first.connect("127.0.0.1", "127.0.0.1", server.getLocalPort(), "绑定甲");
+            try (Socket firstAccepted = server.accept()) {
+                welcome(firstAccepted);
+                firstProbe.awaitState(ChatConnection.State.CONNECTED);
+                checkBoundEndpoint(first, firstAccepted, "127.0.0.1");
+                second.connect("127.0.0.1", "127.0.0.1", server.getLocalPort(), "绑定乙");
+                try (Socket secondAccepted = server.accept()) {
+                    welcome(secondAccepted);
+                    secondProbe.awaitState(ChatConnection.State.CONNECTED);
+                    checkBoundEndpoint(second, secondAccepted, "127.0.0.1");
+                    check(firstAccepted.getPort() != secondAccepted.getPort(),
+                            "同一本地地址的两个连接未使用不同临时端口");
+                    check(first.state() == ChatConnection.State.CONNECTED
+                                    && second.state() == ChatConnection.State.CONNECTED,
+                            "同一本地地址的两个客户端未能同时在线");
+                    first.disconnect();
+                    firstProbe.awaitState(ChatConnection.State.DISCONNECTED);
+                    first.connect("127.0.0.1", "127.0.0.1", server.getLocalPort(), "重连甲");
+                    try (Socket reconnected = server.accept()) {
+                        welcome(reconnected);
+                        firstProbe.awaitState(ChatConnection.State.CONNECTED);
+                        checkBoundEndpoint(first, reconnected, "127.0.0.1");
+                        check(second.state() == ChatConnection.State.CONNECTED,
+                                "同地址客户端重连影响了另一连接");
+                    }
+                }
+            }
+        }
+    }
+
+    private static void unavailableLocalBinding() throws Exception {
+        Set<String> localAddresses = new HashSet<>();
+        var interfaces = NetworkInterface.getNetworkInterfaces();
+        check(interfaces != null, "无法枚举本机网络接口");
+        for (NetworkInterface networkInterface : Collections.list(interfaces)) {
+            for (InetAddress address : Collections.list(networkInterface.getInetAddresses())) {
+                localAddresses.add(address.getHostAddress());
+            }
+        }
+        String unavailable = List.of("192.0.2.123", "198.51.100.123", "203.0.113.123").stream()
+                .filter(address -> !localAddresses.contains(address))
+                .findFirst().orElseThrow(() -> new AssertionError("测试所用地址均已配置到本机"));
+        check(NetworkInterface.getByInetAddress(InetAddress.getByName(unavailable)) == null,
+                "测试地址已经属于本机接口");
+        Probe probe = new Probe();
+        try (ServerSocket server = loopbackServer();
+             ChatConnection connection = new ChatConnection(probe)) {
+            server.setSoTimeout(5000);
+            connection.connect("127.0.0.1", "127.0.0.1", server.getLocalPort(), "绑定恢复");
+            try (Socket accepted = server.accept()) {
+                welcome(accepted);
+                probe.awaitState(ChatConnection.State.CONNECTED);
+                checkBoundEndpoint(connection, accepted, "127.0.0.1");
+                connection.disconnect();
+                probe.awaitState(ChatConnection.State.DISCONNECTED);
+            }
+            connection.connect(unavailable, "127.0.0.1", server.getLocalPort(), "绑定失败");
+            StateEvent failed = probe.awaitState(ChatConnection.State.DISCONNECTED);
+            check(failed.detail().contains("本地绑定失败") && failed.detail().contains(unavailable),
+                    "未配置地址绑定失败缺少阶段或地址说明：" + failed.detail());
+            check(connection.endpoint().isEmpty(), "绑定失败后仍显示活动连接端点");
+            server.setSoTimeout(250);
+            expect(SocketTimeoutException.class, () -> {
+                try (Socket unexpected = server.accept()) {
+                    throw new AssertionError("本地绑定失败后服务端仍接入了连接："
+                            + unexpected.getRemoteSocketAddress());
+                }
+            });
+            server.setSoTimeout(5000);
+            connection.connect("127.0.0.1", "127.0.0.1", server.getLocalPort(), "重新绑定");
+            try (Socket recovered = server.accept()) {
+                welcome(recovered);
+                probe.awaitState(ChatConnection.State.CONNECTED);
+                checkBoundEndpoint(connection, recovered, "127.0.0.1");
+            }
+        }
+    }
+
+    private static void welcome(Socket accepted) throws Exception {
+        accepted.setSoTimeout(5000);
+        Frame join = ProtocolCodec.read(accepted.getInputStream());
+        check(join != null && join.type() == MessageType.JOIN, "本地绑定测试未收到 JOIN");
+        ProtocolCodec.write(accepted.getOutputStream(), new Frame(MessageType.WELCOME, join.requestId(),
+                System.currentTimeMillis(), "", join.from(), "", "", List.of()));
+    }
+
+    private static void checkBoundEndpoint(ChatConnection connection, Socket accepted, String localHost) {
+        check(accepted.getInetAddress().getHostAddress().equals(localHost),
+                "服务端观察到的来源地址与本地绑定地址不一致");
+        String expected = accepted.getInetAddress().getHostAddress() + ":" + accepted.getPort()
+                + " → " + accepted.getLocalAddress().getHostAddress() + ":" + accepted.getLocalPort();
+        check(connection.endpoint().equals(expected), "客户端端点与服务端实际 Socket 端点不一致");
+    }
+
     private static void connectionRefused() throws Exception {
         int unavailablePort;
         try (ServerSocket reserved = loopbackServer()) {
@@ -56,10 +164,13 @@ public final class ConnectionTest {
         Probe probe = new Probe();
         try (ChatConnection connection = new ChatConnection(probe, FAST)) {
             expect(IllegalStateException.class, () -> connection.send("PUBLIC", "尚未连接"));
-            expect(IllegalArgumentException.class, () -> connection.connect("localhost", 5000, "甲"));
-            connection.connect("127.0.0.1", unavailablePort, "甲");
+            expect(IllegalArgumentException.class,
+                    () -> connection.connect("127.0.0.1", "localhost", 5000, "甲"));
+            expect(IllegalArgumentException.class,
+                    () -> connection.connect("0.0.0.0", "127.0.0.1", 5000, "甲"));
+            connection.connect("127.0.0.1", "127.0.0.1", unavailablePort, "甲");
             StateEvent event = probe.awaitState(ChatConnection.State.DISCONNECTED);
-            check(!event.detail().isBlank(), "A15 连接失败缺少原因");
+            check(event.detail().contains("远端连接失败"), "A15 连接失败缺少远端连接说明");
             check(connection.state() == ChatConnection.State.DISCONNECTED, "A15 连接失败未恢复状态");
             check(probe.connectedCount.get() == 0, "A15 连接失败却宣称已经连接");
         }
@@ -72,10 +183,10 @@ public final class ConnectionTest {
             try (FaultPeer peer = new FaultPeer(fault);
                  ChatConnection connection = new ChatConnection(probe, FAST)) {
                 long start = System.nanoTime();
-                connection.connect("127.0.0.1", peer.port(), "期限测试");
+                connection.connect("127.0.0.1", "127.0.0.1", peer.port(), "期限测试");
                 peer.awaitJoined();
                 expect(IllegalStateException.class,
-                        () -> connection.connect("127.0.0.1", peer.port(), "重复连接"));
+                        () -> connection.connect("127.0.0.1", "127.0.0.1", peer.port(), "重复连接"));
                 if (welcomed) {
                     probe.awaitState(ChatConnection.State.CONNECTED);
                     check(connection.endpoint().contains("127.0.0.1:" + peer.port()),
@@ -101,7 +212,7 @@ public final class ConnectionTest {
             Probe probe = new Probe();
             try (FaultPeer peer = new FaultPeer(fault);
                  ChatConnection connection = new ChatConnection(probe, FAST)) {
-                connection.connect("127.0.0.1", peer.port(), "甲");
+                connection.connect("127.0.0.1", "127.0.0.1", peer.port(), "甲");
                 StateEvent event = probe.awaitState(ChatConnection.State.DISCONNECTED);
                 check(!event.detail().isBlank(), "协议失败缺少可见原因");
                 if (fault == Fault.REJECT_JOIN) {
@@ -121,7 +232,7 @@ public final class ConnectionTest {
              ChatConnection connection = new ChatConnection(probe, FAST)) {
             server.start();
             for (int attempt = 0; attempt < 8; attempt++) {
-                connection.connect("127.0.0.1", server.port(), "连接甲");
+                connection.connect("127.0.0.1", "127.0.0.1", server.port(), "连接甲");
                 probe.awaitState(ChatConnection.State.CONNECTED);
                 long requestId = connection.send("PUBLIC", "中文😀\n连接 " + attempt);
                 Frame echo = probe.awaitFrame(MessageType.CHAT_EVENT);
@@ -131,7 +242,7 @@ public final class ConnectionTest {
                 expect(IllegalArgumentException.class, () -> connection.send("连接甲", "私聊自己"));
                 expect(IllegalArgumentException.class, () -> connection.send("PUBLIC", " \t\n"));
                 expect(IllegalStateException.class,
-                        () -> connection.connect("127.0.0.1", server.port(), "连接乙"));
+                        () -> connection.connect("127.0.0.1", "127.0.0.1", server.port(), "连接乙"));
                 if (attempt == 0) {
                     Frame pong = probe.awaitFrame(MessageType.PONG);
                     check(pong.requestId() > 0, "PONG 缺少关联请求号");
@@ -145,7 +256,7 @@ public final class ConnectionTest {
                 probe.clearFrames();
             }
             check(probe.maxCallbackConcurrency.get() == 1, "A16 监听回调发生并行执行");
-            connection.connect("127.0.0.1", server.port(), "服务退出");
+            connection.connect("127.0.0.1", "127.0.0.1", server.port(), "服务退出");
             probe.awaitState(ChatConnection.State.CONNECTED);
             server.close();
             StateEvent event = probe.awaitState(ChatConnection.State.DISCONNECTED);
@@ -158,13 +269,13 @@ public final class ConnectionTest {
         Probe probe = new Probe();
         try (FaultPeer peer = new FaultPeer(Fault.NO_WELCOME)) {
             ChatConnection connection = new ChatConnection(probe, FAST);
-            connection.connect("127.0.0.1", peer.port(), "关闭测试");
+            connection.connect("127.0.0.1", "127.0.0.1", peer.port(), "关闭测试");
             peer.awaitJoined();
             connection.close();
             check(connection.state() == ChatConnection.State.DISCONNECTED,
                     "A22 握手中关闭后状态未结束");
             expect(IllegalStateException.class,
-                    () -> connection.connect("127.0.0.1", peer.port(), "已经关闭"));
+                    () -> connection.connect("127.0.0.1", "127.0.0.1", peer.port(), "已经关闭"));
             connection.close();
         }
     }
@@ -198,12 +309,12 @@ public final class ConnectionTest {
              ChatConnection connection = new ChatConnection(delayed, FAST)) {
             server.start();
             try {
-                connection.connect("127.0.0.1", server.port(), "旧连接");
+                connection.connect("127.0.0.1", "127.0.0.1", server.port(), "旧连接");
                 check(callbackEntered.await(5, TimeUnit.SECONDS), "串行回调测试未开始");
                 waitUntil(() -> connection.state() == ChatConnection.State.CONNECTED, "旧连接未建立");
                 connection.disconnect();
                 waitUntil(() -> connection.state() == ChatConnection.State.DISCONNECTED, "旧连接未结束");
-                connection.connect("127.0.0.1", server.port(), "新连接");
+                connection.connect("127.0.0.1", "127.0.0.1", server.port(), "新连接");
                 waitUntil(() -> connection.state() == ChatConnection.State.CONNECTED, "新连接未建立");
                 releaseCallbacks.countDown();
                 StateEvent connected = probe.awaitState(ChatConnection.State.CONNECTED);
@@ -259,9 +370,9 @@ public final class ConnectionTest {
              ChatConnection sender = new ChatConnection(discardListener)) {
             server.start();
             try {
-                receiver.connect("127.0.0.1", server.port(), "慢监听甲");
+                receiver.connect("127.0.0.1", "127.0.0.1", server.port(), "慢监听甲");
                 check(callbackEntered.await(5, TimeUnit.SECONDS), "慢监听器未进入已连接回调");
-                sender.connect("127.0.0.1", server.port(), "发送乙");
+                sender.connect("127.0.0.1", "127.0.0.1", server.port(), "发送乙");
                 waitUntil(() -> sender.state() == ChatConnection.State.CONNECTED, "高频消息发送端未连接");
                 int sent = 0;
                 while (receiver.state() == ChatConnection.State.CONNECTED && sent < 512) {

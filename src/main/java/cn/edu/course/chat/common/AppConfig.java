@@ -11,13 +11,14 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 
-public record AppConfig(Mode mode, String host, int port, String profile,
+public record AppConfig(Mode mode, String localHost, String host, int port, String profile,
                         Path applicationRoot, Path configFile) {
     public enum Mode { SERVER, CLIENT }
 
-    private static final Set<String> PROPERTY_KEYS = Set.of("host", "port");
+    private static final Set<String> SERVER_PROPERTY_KEYS = Set.of("host", "port");
+    private static final Set<String> CLIENT_PROPERTY_KEYS = Set.of("localHost", "host", "port");
     private static final Set<String> ARGUMENT_KEYS =
-            Set.of("--config", "--host", "--port", "--profile");
+            Set.of("--config", "--local-host", "--host", "--port", "--profile");
 
     public static AppConfig parse(String[] arguments) throws IOException {
         return parse(arguments, locateApplicationRoot());
@@ -38,8 +39,8 @@ public record AppConfig(Mode mode, String host, int port, String profile,
             if (!ARGUMENT_KEYS.contains(key)) {
                 throw new IllegalArgumentException("未知参数：" + key);
             }
-            if (mode == Mode.SERVER && key.equals("--profile")) {
-                throw new IllegalArgumentException("server 不接受 --profile");
+            if (mode == Mode.SERVER && (key.equals("--profile") || key.equals("--local-host"))) {
+                throw new IllegalArgumentException("server 不接受 " + key);
             }
             if (index + 1 >= arguments.length || arguments[index + 1].startsWith("--")
                     || arguments[index + 1].isBlank()) {
@@ -69,10 +70,16 @@ public record AppConfig(Mode mode, String host, int port, String profile,
         try (Reader reader = Files.newBufferedReader(configFile, StandardCharsets.UTF_8)) {
             properties.load(reader);
         }
+        Set<String> propertyKeys = mode == Mode.SERVER ? SERVER_PROPERTY_KEYS : CLIENT_PROPERTY_KEYS;
         for (String key : properties.stringPropertyNames()) {
-            if (!PROPERTY_KEYS.contains(key)) {
+            if (!propertyKeys.contains(key)) {
                 throw new IllegalArgumentException("未知配置键：" + key);
             }
+        }
+        String localHost = "";
+        if (mode == Mode.CLIENT) {
+            localHost = options.getOrDefault("--local-host", properties.getProperty("localHost", "172.16.1.11"));
+            Validation.host(localHost);
         }
         String host = options.getOrDefault("--host", properties.getProperty("host", "172.16.1.10"));
         Validation.host(host);
@@ -84,7 +91,7 @@ public record AppConfig(Mode mode, String host, int port, String profile,
         Validation.port(port);
         String profile = mode == Mode.CLIENT
                 ? Validation.profile(options.getOrDefault("--profile", "default")) : "";
-        return new AppConfig(mode, host, port, profile, applicationRoot, configFile);
+        return new AppConfig(mode, localHost, host, port, profile, applicationRoot, configFile);
     }
 
     public Path dataRoot() {
@@ -92,7 +99,7 @@ public record AppConfig(Mode mode, String host, int port, String profile,
     }
 
     public boolean developmentLoopback() {
-        return host.startsWith("127.");
+        return host.startsWith("127.") || localHost.startsWith("127.");
     }
 
     public static Path locateApplicationRoot() {
@@ -117,6 +124,6 @@ public record AppConfig(Mode mode, String host, int port, String profile,
 
     public static String usage() {
         return "用法：java -jar dist/chat.jar server|client [--config 路径] [--host IPv4]"
-                + " [--port 端口] [client 模式：--profile 资料名称]";
+                + " [--port 端口] [client 模式：--local-host 本地IPv4 --profile 资料名称]";
     }
 }

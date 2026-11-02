@@ -27,12 +27,14 @@ public final class Main {
             System.out.println("应用目录：" + config.applicationRoot());
             System.out.println("配置文件：" + config.configFile());
             if (config.developmentLoopback()) {
-                System.out.println("开发回环自测模式：" + config.host() + ":" + config.port()
-                        + "，指定 IP 验收仍需单独执行");
+                System.out.println("开发回环自测模式：已明确选择回环地址，指定 IP 验收仍需单独执行");
             }
             if (config.mode() == AppConfig.Mode.SERVER) {
                 runServer(config);
             } else {
+                System.out.println("客户端本地所选地址：" + config.localHost()
+                        + ":0（连接时由系统分配端口）");
+                System.out.println("服务端目标：" + config.host() + ":" + config.port());
                 runClient(config);
             }
         } catch (Exception failure) {
@@ -82,7 +84,7 @@ public final class Main {
             System.out.println("客户端资料目录：" + store.directory());
             List<Frame> history = store.load().get();
             SwingUtilities.invokeAndWait(() -> {
-                MainFrame frame = new MainFrame(config.host(), config.port(), "", store);
+                MainFrame frame = new MainFrame(config.localHost(), config.host(), config.port(), "", store);
                 frameReference.set(frame);
                 frame.showHistory(history);
                 frame.setHistoryStatus(latestStatus.get());

@@ -62,6 +62,7 @@ public final class MainFrame extends JFrame {
     private final ConversationModel model = new ConversationModel();
     private final ExecutorService cleanup = Executors.newSingleThreadExecutor(runnable ->
             new Thread(runnable, "chat-window-cleanup"));
+    private final JTextField localHostField;
     private final JTextField hostField;
     private final JTextField portField;
     private final JTextField nicknameField;
@@ -101,14 +102,17 @@ public final class MainFrame extends JFrame {
     private long lastCompositionCommit;
     private boolean rebuildingConversations;
 
-    public MainFrame(String host, int port, String nickname, HistoryStore store) {
+    public MainFrame(String localHost, String host, int port, String nickname, HistoryStore store) {
         super("局域网聊天 · " + store.directory().getFileName());
         requireEdt();
         this.store = store;
+        localHostField = new JTextField(localHost, 13);
         hostField = new JTextField(host, 13);
         portField = new JTextField(Integer.toString(port), 5);
         nicknameField = new JTextField(nickname, 10);
         ownNickname = nickname;
+        localHostField.getAccessibleContext().setAccessibleName("客户端本地 IP");
+        localHostField.setToolTipText("连接前绑定的本地 IPv4 地址，本地端口由系统分配");
         hostField.getAccessibleContext().setAccessibleName("服务端 IP");
         portField.getAccessibleContext().setAccessibleName("服务端端口");
         nicknameField.getAccessibleContext().setAccessibleName("昵称");
@@ -128,16 +132,22 @@ public final class MainFrame extends JFrame {
         setSize(1080, 760);
         setLocationByPlatform(true);
 
-        JPanel connectionPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 9));
-        connectionPanel.add(new JLabel("服务端 IP"));
-        connectionPanel.add(hostField);
-        connectionPanel.add(new JLabel("端口"));
-        connectionPanel.add(portField);
+        JPanel addressPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 6));
+        addressPanel.add(new JLabel("客户端本地 IP"));
+        addressPanel.add(localHostField);
+        addressPanel.add(new JLabel("服务端 IP"));
+        addressPanel.add(hostField);
+        addressPanel.add(new JLabel("服务端端口"));
+        addressPanel.add(portField);
+        JPanel connectionPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 6));
         connectionPanel.add(new JLabel("昵称"));
         connectionPanel.add(nicknameField);
         connectionPanel.add(connectButton);
         connectionPanel.add(stateLabel);
-        add(connectionPanel, BorderLayout.NORTH);
+        JPanel connectionArea = new JPanel(new GridLayout(0, 1));
+        connectionArea.add(addressPanel);
+        connectionArea.add(connectionPanel);
+        add(connectionArea, BorderLayout.NORTH);
 
         conversationList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         onlineList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
@@ -332,13 +342,16 @@ public final class MainFrame extends JFrame {
     }
 
     private void connect() {
+        String localHost;
         String host;
         String nickname;
         int port;
         try {
+            localHost = localHostField.getText().strip();
             host = hostField.getText().strip();
             port = Integer.parseInt(portField.getText().strip());
             nickname = Validation.nickname(nicknameField.getText());
+            Validation.host(localHost);
             Validation.host(host);
             Validation.port(port);
         } catch (IllegalArgumentException exception) {
@@ -385,7 +398,7 @@ public final class MainFrame extends JFrame {
                     });
                     state = ChatConnection.State.CONNECTING;
                     refreshControls();
-                    connection.connect(host, port, nickname);
+                    connection.connect(localHost, host, port, nickname);
                 }));
     }
 
@@ -561,6 +574,7 @@ public final class MainFrame extends JFrame {
 
     private void refreshControls() {
         boolean editable = !closing && !loading && !preparing && state == ChatConnection.State.DISCONNECTED;
+        localHostField.setEnabled(editable);
         hostField.setEnabled(editable);
         portField.setEnabled(editable);
         nicknameField.setEnabled(editable);

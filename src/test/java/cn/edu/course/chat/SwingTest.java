@@ -238,7 +238,7 @@ public final class SwingTest {
         try {
             List<Frame> history = store.load().get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
             MainFrame frame = onEdt(() -> {
-                MainFrame created = new MainFrame(HOST, port, nickname, store);
+                MainFrame created = new MainFrame(HOST, HOST, port, nickname, store);
                 reference.set(created);
                 created.showHistory(history);
                 created.setHistoryStatus(status.get());
@@ -349,7 +349,7 @@ public final class SwingTest {
         windows.add(target);
         connect(target);
         try (RealSender sender = new RealSender()) {
-            sender.connection.connect(HOST, server.port(), senderNickname);
+            sender.connection.connect(HOST, HOST, server.port(), senderNickname);
             await("真实过载发送者加入", () -> sender.connection.state() == ChatConnection.State.CONNECTED);
             sender.awaitFrame(frame -> frame.type() == MessageType.WELCOME
                     && frame.from().equals(senderNickname));
@@ -472,7 +472,7 @@ public final class SwingTest {
         String observerNickname = "RapidObserver";
         try (RealSender observer = new RealSender();
              WithheldWelcomePeer firstPeer = new WithheldWelcomePeer(nickname)) {
-            observer.connection.connect(HOST, server.port(), observerNickname);
+            observer.connection.connect(HOST, HOST, server.port(), observerNickname);
             observer.awaitFrame(frame -> frame.type() == MessageType.WELCOME
                     && frame.from().equals(observerNickname));
             GuiClient target = open(dataRoot, "gui-rapid", nickname, firstPeer.port(), 0);

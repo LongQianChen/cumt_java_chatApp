@@ -7,8 +7,11 @@ import cn.edu.course.chat.common.Validation;
 
 import java.io.EOFException;
 import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -67,7 +70,8 @@ public final class ChatConnection implements AutoCloseable {
                 new ArrayBlockingQueue<>(128), task -> worker("callbacks", task));
     }
 
-    public void connect(String host, int port, String nickname) {
+    public void connect(String localHost, String host, int port, String nickname) {
+        Validation.host(localHost);
         Validation.host(host);
         Validation.port(port);
         String acceptedNickname = Validation.nickname(nickname);
@@ -78,14 +82,15 @@ public final class ChatConnection implements AutoCloseable {
             if (state != State.DISCONNECTED) {
                 throw new IllegalStateException("当前连接尚未结束");
             }
-            Session session = new Session(++generation, host, port, acceptedNickname);
+            Session session = new Session(++generation, localHost, host, port, acceptedNickname);
             current = session;
             endpoint = "";
             state = State.CONNECTING;
             session.timer.scheduleWithFixedDelay(() -> check(session), options.checkMillis(),
                     options.checkMillis(), TimeUnit.MILLISECONDS);
             startWorker("reader-" + session.generation, () -> read(session));
-            dispatchState(session, State.CONNECTING, "正在连接 " + host + ":" + port);
+            dispatchState(session, State.CONNECTING,
+                    "正在通过本地地址 " + localHost + " 连接 " + host + ":" + port);
         }
     }
 
@@ -184,28 +189,43 @@ public final class ChatConnection implements AutoCloseable {
     }
 
     private void read(Session session) {
+        String failureContext = "本地绑定失败（地址 " + session.localHost + "）";
         try {
-            session.socket.connect(new InetSocketAddress(session.host, session.port), options.connectMillis());
-            session.socket.setTcpNoDelay(true);
+            Socket socket = new Socket();
+            session.socket = socket;
+            if (session.stopped.get()) {
+                socket.close();
+                return;
+            }
+            socket.bind(new InetSocketAddress(session.localHost, 0));
+            session.phase = "远端连接";
+            failureContext = "远端连接失败（" + session.host + ":" + session.port + "）";
+            socket.connect(new InetSocketAddress(session.host, session.port), options.connectMillis());
+            socket.setTcpNoDelay(true);
+            String actualEndpoint = socket.getLocalAddress().getHostAddress() + ":" + socket.getLocalPort()
+                    + " → " + socket.getInetAddress().getHostAddress() + ":" + socket.getPort();
             synchronized (lifecycle) {
                 if (!active(session)) {
                     return;
                 }
                 session.connectedAt = System.nanoTime();
                 session.lastReceived = session.connectedAt;
-                endpoint = session.socket.getLocalSocketAddress() + " → " + session.socket.getRemoteSocketAddress();
+                endpoint = actualEndpoint;
                 session.outgoing.add(Frame.request(MessageType.JOIN, session.joinId, session.nickname, "", ""));
                 startWorker("writer-" + session.generation, () -> write(session));
             }
+            new PrintWriter(new OutputStreamWriter(System.out, StandardCharsets.UTF_8), true)
+                    .println("[客户端] Socket 已连接：" + actualEndpoint);
+            failureContext = "接收失败，连接已断开";
             while (!session.stopped.get()) {
-                Frame frame = ProtocolCodec.read(session.socket.getInputStream());
+                Frame frame = ProtocolCodec.read(socket.getInputStream());
                 if (frame == null) {
                     throw new EOFException("服务端已经关闭连接");
                 }
                 receive(session, frame);
             }
         } catch (IOException | IllegalArgumentException exception) {
-            finish(session, "连接已断开：" + exception.getMessage());
+            finish(session, failureContext + "：" + exception.getMessage());
         } finally {
             finish(session, "连接已结束");
         }
@@ -271,7 +291,7 @@ public final class ChatConnection implements AutoCloseable {
             }
             if (state == State.CONNECTING) {
                 if (session.connectedAt == 0 && elapsed(now, session.startedAt) >= options.connectMillis()) {
-                    reason = "建立连接超时";
+                    reason = session.phase + "超时";
                 } else if (session.connectedAt != 0
                         && elapsed(now, session.connectedAt) >= options.handshakeMillis()) {
                     reason = "等待服务端 WELCOME 超时";
@@ -298,7 +318,10 @@ public final class ChatConnection implements AutoCloseable {
         }
         session.timer.shutdownNow();
         try {
-            session.socket.close();
+            Socket socket = session.socket;
+            if (socket != null) {
+                socket.close();
+            }
         } catch (IOException exception) {
             detail += "；关闭 Socket 失败：" + exception.getMessage();
         }
@@ -390,11 +413,11 @@ public final class ChatConnection implements AutoCloseable {
 
     private final class Session {
         final long generation;
+        final String localHost;
         final String host;
         final int port;
         final String nickname;
         final long joinId = nextRequestId();
-        final Socket socket = new Socket();
         final ArrayBlockingQueue<Frame> outgoing = new ArrayBlockingQueue<>(options.queueCapacity());
         final AtomicBoolean stopped = new AtomicBoolean();
         final AtomicBoolean callbackOverflow = new AtomicBoolean();
@@ -404,10 +427,13 @@ public final class ChatConnection implements AutoCloseable {
         volatile long lastReceived;
         volatile long lastPing;
         volatile Thread writer;
+        volatile Socket socket;
+        volatile String phase = "本地绑定";
         volatile String requestedStop;
 
-        Session(long generation, String host, int port, String nickname) {
+        Session(long generation, String localHost, String host, int port, String nickname) {
             this.generation = generation;
+            this.localHost = localHost;
             this.host = host;
             this.port = port;
             this.nickname = nickname;
